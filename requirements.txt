@@ -1,0 +1,8 @@
+torch
+torchaudio
+transformers
+datasets
+librosa
+wandb
+tqdm
+ 
