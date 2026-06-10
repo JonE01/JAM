@@ -1,0 +1,25 @@
+# SAE Training Config
+# Pass to SAE_train.py with: python SAE_train.py --config config.yaml
+
+run_name: "RELU_test_1e-4_05"
+wandb_project: "mert-sae"
+
+# Model
+sae_type: "RELU_SAE"          # "SAE" or "RELU_SAE"
+expansion_factors: [4, 16, 32]
+
+# Data
+layer_idx: -1
+window_size: 1125              # ~30 seconds
+dataset_dir: null              # null = auto-derive from window_size/layer_idx
+
+# Training
+lr: 1.0e-4
+batch_size: 512
+epochs: 50
+rho: 0.05
+sparsity_loss_weight: 0.05
+cascading_lr: false
+
+# Resume
+resume_from: null              # e.g. "checkpoints/epoch3_batch200.pt"
