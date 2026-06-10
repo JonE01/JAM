@@ -1,3 +1,5 @@
+from xml.parsers.expat import model
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -82,6 +84,19 @@ class Decoder(nn.Module):
     inv_conv = inv_conv.transpose(1,2) #[batch, time_steps, feature_size]
     return inv_conv
 
+class RELUEncoder(Encoder):
+    def __init__(self, input_dim, latent_size, stride):
+        super().__init__(input_dim, latent_size, stride)
+
+    def forward(self, input):
+        #I picked sigmoid bc it
+        # Still encodes info from negative inputs
+        # Doesn't stress small diffs in extreme inputs
+        transposed = input.transpose(1,2)
+        conv = self.conv_1d(transposed)
+        conv = conv.transpose(1,2)
+        fc = self.fully_connected1(conv) #[batch, time_steps/stride, latent_size]
+        return torch.relu(fc)
 
 class SAE(nn.Module):
   def __init__(self, input_dim, latent_size, loss_fn=F.mse_loss, lr=1e-4, l2=0., rho=.05):
@@ -91,7 +106,7 @@ class SAE(nn.Module):
     self.encoder = Encoder(input_dim, latent_size, 25)
     self.decoder = Decoder(input_dim, latent_size, 25)
     self.loss_fn = loss_fn
-    self.rho_loss_val = None
+    self.sparsity_loss_val = None
     self.L0_loss = None
     self._loss = None
     self.rho = rho
@@ -105,29 +120,48 @@ class SAE(nn.Module):
     decoded = self.decoder(encoded)
     return decoded
 
-  def rho_loss(self, average = True):
+  def sparsity_loss(self, average = True):
     rho_hat = self.data_rho.clamp(1e-7, 1 - 1e-7)
     dkl = self.rho * torch.log(self.rho / rho_hat) + (1 - self.rho) * torch.log((1 - self.rho) / (1 - rho_hat))
     if average:
-      self.rho_loss_val = dkl.mean()
+      self.sparsity_loss_val = dkl.mean()
     else:
-      self.rho_loss_val = dkl.sum()
+      self.sparsity_loss_val = dkl.sum()
 
-    return self.rho_loss_val
+    return self.sparsity_loss_val
 
   def l0_loss(self):
     return self.L0_loss
 
+class RELU_SAE(SAE):
+    def __init__(self, input_dim, latent_size, loss_fn=F.mse_loss, lr=1e-4, l2=0., rho=.05):
+        super().__init__(input_dim, latent_size, loss_fn, lr, l2)
+        self.encoder = RELUEncoder(input_dim, latent_size, stride=25)
+      
+    def forward(self,input):
+        #This stacks the rows horizontally, which matches to stacking the 768 features for each second side by side
+        encoded = self.encoder(input)
+        self.L1 = encoded.sum(dim=1).float()
+        self.L0_loss = (encoded > 0).float().mean()
+        decoded = self.decoder(encoded)
+        return decoded
+    def sparsity_loss(self, average = True):
+        if average:
+            self.sparsity_loss_val = self.L1.mean(dim=0)
+        else:
+            self.sparsity_loss_val = self.L1.sum(dim=0)
+        return self.sparsity_loss_val
 
-def train(epoch, models, train_loader, rho_loss_weight, model_folder_path, log=None,
+
+def train(epoch, models, train_loader, sparsity_loss_weight, model_folder_path, log=None,
           checkpoint_dir="checkpoints", resume_from=None):
     """
     Args:
         epoch          : current epoch number
         models         : dict of {name: SAE}
         train_loader   : DataLoader yielding (hidden_states, labels)
-        rho            : sparsity target
-        log            : dict of {name: []} to accumulate (loss, rho_loss) tuples
+        sparsity_loss_weight : weight for the sparsity loss
+        log            : dict of {name: []} to accumulate (loss, sparsity_loss) tuples
         checkpoint_dir : where to save .pt checkpoints
         resume_from    : path to a checkpoint file to resume from, or None
     """
@@ -165,10 +199,10 @@ def train(epoch, models, train_loader, rho_loss_weight, model_folder_path, log=N
             output = model(data)
             # output_time = time.time() - forward_start
 
-            rho_l  = model.rho_loss(average=True)
+            sparsity_l  = model.sparsity_loss(average=True)
             mse_loss = model.loss_fn(output, data)
             model._loss = mse_loss
-            loss   = mse_loss + rho_loss_weight*rho_l
+            loss   = mse_loss + sparsity_loss_weight*sparsity_l
 
             # backprop_start = time.time()
             loss.backward()
@@ -188,16 +222,22 @@ def train(epoch, models, train_loader, rho_loss_weight, model_folder_path, log=N
             # model_timing_str += f"{model_name}: {t:.2f} "
         # print(model_timing_str)
         # ── logging every n batches ─────────────────────────────────────────
+        if type(model) == SAE:
+            sparsity_loss_type = "kl_loss"
+        elif type(model) == RELU_SAE:
+            sparsity_loss_type = "L1_loss"
+        else:
+            sparsity_loss_type = "sparsity_loss"
         if batch_idx % 5 == 0:
             log_dict = {"epoch": epoch, "batch": batch_idx}
             for k, m in models.items():
                 log_dict[f"{k}/loss"]     = m._loss.item()
-                log_dict[f"{k}/rho_loss"] = m.rho_loss_val.item()
+                log_dict[f"{k}/{sparsity_loss_type}"] = m.sparsity_loss_val.item()
                 log_dict[f"{k}/l0_loss"]  = m.l0_loss()
             wandb.log(log_dict)
 
             line = f"Train Epoch: {epoch} [batch {batch_idx}] Time {time.time()-orig_start_time}\t"
-            line += "  ".join([f"{k} loss: {m._loss.item():.6f} rho_loss: {m.rho_loss_val.item()}" for k, m in models.items()])
+            line += "  ".join([f"{k} loss: {m._loss.item():.6f} {sparsity_loss_type}: {m.sparsity_loss_val.item()}" for k, m in models.items()])
             print(line)
             orig_start_time = time.time()
         #abt 30 mins of work
@@ -223,12 +263,12 @@ def train(epoch, models, train_loader, rho_loss_weight, model_folder_path, log=N
     # ── end-of-epoch summary ──────────────────────────────────────────────────
     if log is not None:
         for k, m in models.items():
-            log[k].append((m._loss.item(), m.rho_loss_val.item()))
+            log[k].append((m._loss.item(), m.sparsity_loss_val.item()))
 
 
 def test(models, loader, model_folder_path, best_losses, log=None):
     total_loss = {k: 0. for k in models}
-    total_rho  = {k: 0. for k in models}
+    total_sparsity  = {k: 0. for k in models}
     total_l0 = {k: 0. for k in models}
     n_batches  = 0
 
@@ -239,20 +279,26 @@ def test(models, loader, model_folder_path, best_losses, log=None):
             for k, m in models.items():
                 out = m(data)
                 total_loss[k] += m.loss_fn(out, data).item()
-                total_rho[k]  += m.rho_loss(average=True).item()
+                total_sparsity[k]  += m.sparsity_loss(average=True).item()
                 total_l0[k] += m.l0_loss().item()
 
     log_dict = {}
     for k, m in models.items():
+        if type(m) == SAE:
+            sparsity_loss_type = "kl_loss"
+        elif type(m) == RELU_SAE:
+            sparsity_loss_type = "L1_loss"
+        else:
+            sparsity_loss_type = "sparsity_loss"
         avg_loss = total_loss[k] / n_batches
-        avg_rho  = total_rho[k] / n_batches
+        avg_sparsity  = total_sparsity[k] / n_batches
         avg_l0 = total_l0[k] / n_batches
-        print(f"{k}:  loss: {avg_loss:.6f}    rho_loss: {avg_rho:.6f}    l0_loss: {avg_l0:.4f}")
+        print(f"{k}:  loss: {avg_loss:.6f}    {sparsity_loss_type}: {avg_sparsity:.6f}    l0_loss: {avg_l0:.4f}")
         log_dict[f"{k}/val_loss"]     = avg_loss
-        log_dict[f"{k}/val_rho_loss"] = avg_rho
+        log_dict[f"{k}/val_{sparsity_loss_type}"] = avg_sparsity
         log_dict[f"{k}/val_l0_loss"]  = avg_l0
         if log is not None:
-            log[k].append((avg_loss, avg_rho))
+            log[k].append((avg_loss, avg_sparsity))
 
         if avg_loss < best_losses[k]:
             best_losses[k] = avg_loss
@@ -269,7 +315,7 @@ def test(models, loader, model_folder_path, best_losses, log=None):
 
 
 #TODO Add L0 logging just cause
-run_name = "flat_lr_test_1_rho09"
+run_name = "RELU_test_1e-4_05"
 
 wandb.login(key=WANDB_API_KEY)
 wandb.init(
@@ -279,9 +325,9 @@ wandb.init(
         "layer_idx":   -1,
         "window_size": 1125, #~30 seconds consider cutting this in half
         "rho":         0.05,
-        "lr":          1,
+        "lr":          1e-4,
         "batch_size":  512,
-        "rho_loss_weight": .09, #Right down the middle. Good performance in the original paper
+        "sparsity_loss_weight": .05, #Right down the middle. Good performance in the original paper
         "epochs": 50,
         "cascading_lr": False,
     }
@@ -319,10 +365,9 @@ print(f"SAE input_dim      : {input_dim}  ({window_size} steps × {feature_dim} 
 
 expansion_factors = [4, 16, 32]
 models = {
-    str(x): SAE(input_dim, feature_dim * x).to(device)
+    str(x): RELU_SAE(input_dim, feature_dim * x,lr=wandb.config.lr).to(device)
     for x in expansion_factors
 }
-
 train_log = {k: [] for k in models}
 test_log  = {k: [] for k in models}
 best_losses = {k: float("inf") for k in models}
@@ -346,7 +391,7 @@ os.makedirs(model_folder_path, exist_ok=True)
 for epoch in range(1, wandb.config.epochs+1):
     for m in models.values():
         m.train()
-    train(epoch, models, train_loader, wandb.config.rho_loss_weight, model_folder_path, log=train_log, resume_from=RESUME_FROM, checkpoint_dir="model_checkpoints")
+    train(epoch, models, train_loader, wandb.config.sparsity_loss_weight, model_folder_path, log=train_log, resume_from=RESUME_FROM, checkpoint_dir="model_checkpoints")
     RESUME_FROM = None #only resume first epoch
 
     for m in models.values():
