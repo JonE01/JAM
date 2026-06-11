@@ -1,5 +1,3 @@
-from xml.parsers.expat import model
-
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -107,7 +105,7 @@ def decode_audio(item):
     except Exception:
         # Fallback for MP3s that soundfile can't open
         array, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True,
-                                 res_type='kaiser_fast', backend='audioread')
+                                 res_type='kaiser_fast')
     item["array"] = array
     item["sample_rate"] = sr
     return item
@@ -272,9 +270,9 @@ class RELU_SAE(SAE):
         return decoded
     def sparsity_loss(self, average = True):
         if average:
-            self.sparsity_loss_val = self.L1.mean(dim=0)
+            self.sparsity_loss_val = self.L1.mean()
         else:
-            self.sparsity_loss_val = self.L1.sum(dim=0)
+            self.sparsity_loss_val = self.L1.sum()
         return self.sparsity_loss_val
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -351,22 +349,22 @@ def train(epoch, models, train_loader, sparsity_loss_weight, model_folder_path, 
                 model.scheduler.step()
 
         # ── logging every n batches ─────────────────────────────────────────
-        if type(model) == SAE:
-            sparsity_loss_type = "kl_loss"
-        elif type(model) == RELU_SAE:
-            sparsity_loss_type = "L1_loss"
+        if type(m) == SAE:
+            sparsity_loss_type = "KL Divergence Loss"
+        elif type(m) == RELU_SAE:
+            sparsity_loss_type = "L1 Loss"
         else:
-            sparsity_loss_type = "sparsity_loss"
-        if batch_idx % 5 == 0:
+            sparsity_loss_type = "Sparsity Loss"
+        if batch_idx % 80 == 0:
             log_dict = {"epoch": epoch, "batch": batch_idx}
             for k, m in models.items():
-                log_dict[f"{k}/loss"]     = m._loss.item()
-                log_dict[f"{k}/{sparsity_loss_type}"] = m.sparsity_loss_val.item()
-                log_dict[f"{k}/l0_loss"]  = m.l0_loss()
+                log_dict[f"E={k} Train MSE Loss"]     = m._loss.item()
+                log_dict[f"E={k} Train {sparsity_loss_type}"] = m.sparsity_loss_val.item()
+                log_dict[f"E={k} Train L0 Loss"]  = m.l0_loss().item()
             wandb.log(log_dict)
 
             line = f"Train Epoch: {epoch} [batch {batch_idx}] Time {time.time()-orig_start_time}\t"
-            line += "  ".join([f"{k} loss: {m._loss.item():.6f} {sparsity_loss_type}: {m.sparsity_loss_val.item()}" for k, m in models.items()])
+            line += "  ".join([f"{k} MSE Loss: {m._loss.item():.6f} {sparsity_loss_type}: {m.sparsity_loss_val.item()}" for k, m in models.items()])
             print(line)
             orig_start_time = time.time()
         #abt 30 mins of work
@@ -418,18 +416,18 @@ def test(models, loader, model_folder_path, best_losses, mert, log=None):
     log_dict = {}
     for k, m in models.items():
         if type(m) == SAE:
-            sparsity_loss_type = "kl_loss"
+            sparsity_loss_type = "KL Divergence Loss"
         elif type(m) == RELU_SAE:
-            sparsity_loss_type = "L1_loss"
+            sparsity_loss_type = "L1 Loss"
         else:
-            sparsity_loss_type = "sparsity_loss"
+            sparsity_loss_type = "Sparsity Loss"
         avg_loss = total_loss[k] / n_batches
         avg_sparsity  = total_sparsity[k] / n_batches
         avg_l0 = total_l0[k] / n_batches
         print(f"{k}:  loss: {avg_loss:.6f}    {sparsity_loss_type}: {avg_sparsity:.6f}    l0_loss: {avg_l0:.4f}")
-        log_dict[f"{k}/val_loss"]     = avg_loss
-        log_dict[f"{k}/val_{sparsity_loss_type}"] = avg_sparsity
-        log_dict[f"{k}/val_l0_loss"]  = avg_l0
+        log_dict[f"E={k} Validation MSE Loss"]     = avg_loss
+        log_dict[f"E={k} Validation {sparsity_loss_type}"] = avg_sparsity
+        log_dict[f"E={k} Validation L0 Loss"]  = avg_l0
         if log is not None:
             log[k].append((avg_loss, avg_sparsity))
 

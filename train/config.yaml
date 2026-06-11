@@ -16,8 +16,8 @@ window_size: 1125              # ~30 seconds at MERT frame rate
 
 # Training
 lr: 1.0e-4
-batch_size: 8                  # keep small (8-32) since MERT runs live on GPU
-epochs: 50
+batch_size: 32                  # keep small (8-32) since MERT runs live on GPU
+epochs: 3
 rho: 0.05
 sparsity_loss_weight: 0.05
 cascading_lr: false
