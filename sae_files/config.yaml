@@ -7,19 +7,23 @@ wandb_project: "mert-sae"
 # Model
 sae_type: "RELU_SAE"          # "SAE" or "RELU_SAE"
 expansion_factors: [4, 16, 32]
+mert_model_name: "m-a-p/MERT-v1-95M"
 
 # Data
+fma_dataset: "benjamin-paine/free-music-archive-large"
 layer_idx: -1
-window_size: 1125              # ~30 seconds
-dataset_dir: null              # null = auto-derive from window_size/layer_idx
+window_size: 1125              # ~30 seconds at MERT frame rate
 
 # Training
 lr: 1.0e-4
-batch_size: 512
+batch_size: 8                  # keep small (8-32) since MERT runs live on GPU
 epochs: 50
 rho: 0.05
 sparsity_loss_weight: 0.05
 cascading_lr: false
+
+# Output
+output_dir: "runs"             # where to save model checkpoints / best models
 
 # Resume
 resume_from: null              # e.g. "checkpoints/epoch3_batch200.pt"
