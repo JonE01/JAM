@@ -1,8 +1,8 @@
 # SAE Training Config
 # Pass to SAE_train.py with: python SAE_train.py --config config.yaml
 
-run_name: "RELU_test_1e-4_05"
-wandb_project: "mert-sae"
+run_name: "RELU_test_1e-2_5"
+wandb_project: "mert-sae-large"
 
 # Model
 sae_type: "RELU_SAE"          # "SAE" or "RELU_SAE"
@@ -15,15 +15,19 @@ layer_idx: -1
 window_size: 1125              # ~30 seconds at MERT frame rate
 
 # Training
-lr: 1.0e-4
+lr: 1.0e-2
 batch_size: 32                  # keep small (8-32) since MERT runs live on GPU
 epochs: 3
 rho: 0.05
-sparsity_loss_weight: 0.05
+sparsity_loss_weight: 0.5
 cascading_lr: false
 
+#checkpointing
+"use_checkpoints": True
+"checkpoint_dir": "checkpoints"  # where to save checkpoints
+
 # Output
-output_dir: "runs"             # where to save model checkpoints / best models
+output_dir: "orcd/scratch/sae_train_large"            # where to save model outputs
 
 # Resume
-resume_from: null              # e.g. "checkpoints/epoch3_batch200.pt"
+resume_from: False             # e.g. "checkpoints/epoch3_batch200.pt"

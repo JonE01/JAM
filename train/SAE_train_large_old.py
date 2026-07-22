@@ -43,8 +43,6 @@ DEFAULT_CONFIG = {
     "wandb_project": "mert-sae",
     "mert_model_name": "m-a-p/MERT-v1-95M",
     "fma_dataset": "benjamin-paine/free-music-archive-large",
-    "use_checkpoints": False,
-    "checkpoint_dir": "checkpoints",
     "output_dir": "runs",             # where to save model checkpoints / best models
 }
 
@@ -107,7 +105,7 @@ def decode_audio(item):
     except Exception:
         # Fallback for MP3s that soundfile can't open
         array, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True,
-                             backend='audioread')
+                                 res_type='kaiser_fast')
     item["array"] = array
     item["sample_rate"] = sr
     return item
@@ -136,7 +134,6 @@ class FMALiveDataset(TorchDataset):
         self.dataset = hf_dataset
         self.sample_rate = sample_rate
         self.resample_rate = processor.sampling_rate
-        self._resampler_cache = {}
 
     def __len__(self):
         return len(self.dataset)
@@ -152,9 +149,7 @@ class FMALiveDataset(TorchDataset):
         sample_rate = item.get("sample_rate", self.sample_rate)
         try:
             if sample_rate != self.resample_rate:
-                if sample_rate not in self._resampler_cache:
-                    self._resampler_cache[sample_rate] = T.Resample(sample_rate, self.resample_rate)
-                resampler = self._resampler_cache[sample_rate]
+                resampler = T.Resample(sample_rate, self.resample_rate)
                 audio_array = resampler(torch.tensor(audio).float())
             else:
                 audio_array = torch.tensor(audio).float()
@@ -294,8 +289,7 @@ SAE_CLASSES = {
 # ═══════════════════════════════════════════════════════════════════════
 
 def train(epoch, models, train_loader, sparsity_loss_weight, model_folder_path, mert,
-          log=None, resume_from=None, global_step=0,
-          val_loader=None, best_losses=None, val_log=None, val_every=350):
+          log=None, checkpoint_dir="checkpoints", resume_from=None):
     """
     Args:
         epoch          : current epoch number
@@ -305,23 +299,16 @@ def train(epoch, models, train_loader, sparsity_loss_weight, model_folder_path, 
         model_folder_path : where to save outputs
         mert           : MERT_model wrapper (frozen, used to compute hidden states)
         log            : dict of {name: []} to accumulate (loss, sparsity_loss) tuples
+        checkpoint_dir : where to save .pt checkpoints
         resume_from    : path to a checkpoint file to resume from, or None
-        global_step    : monotonically increasing step counter for wandb
-        val_loader     : DataLoader for validation (run every val_every batches)
-        best_losses    : dict tracking best val loss per model
-        val_log        : dict of {name: []} for val metrics
-        val_every      : run validation every N batches
-
-    Returns:
-        global_step    : updated step counter
     """
-    # model_checkpoints = {}
-    # checkpoints_path = model_folder_path + "/" + checkpoint_dir
-    # os.makedirs(checkpoints_path, exist_ok=True)
+    model_checkpoints = {}
+    checkpoints_path = model_folder_path + "/" + checkpoint_dir
+    os.makedirs(checkpoints_path, exist_ok=True)
     total_batches = 0
     # ── resume from checkpoint ────────────────────────────────────────────────
     start_batch = 0
-    if resume_from:
+    if resume_from is not None:
         ckpt = torch.load(resume_from)
         for k, model in models.items():
             if k in ckpt["models"]:
@@ -362,71 +349,51 @@ def train(epoch, models, train_loader, sparsity_loss_weight, model_folder_path, 
                 model.scheduler.step()
 
         # ── logging every n batches ─────────────────────────────────────────
+        if type(m) == SAE:
+            sparsity_loss_type = "KL Divergence Loss"
+        elif type(m) == RELU_SAE:
+            sparsity_loss_type = "L1 Loss"
+        else:
+            sparsity_loss_type = "Sparsity Loss"
         if batch_idx % 80 == 0:
             log_dict = {"epoch": epoch, "batch": batch_idx}
             for k, m in models.items():
-                if type(m) == SAE:
-                    sparsity_loss_type = "KL Divergence Loss"
-                elif type(m) == RELU_SAE:
-                    sparsity_loss_type = "L1 Loss"
-                else:
-                    sparsity_loss_type = "Sparsity Loss"
-                log_dict[f"E={k}/Train MSE Loss"]     = m._loss.item()
-                log_dict[f"E={k}/Train {sparsity_loss_type}"] = m.sparsity_loss_val.item()
-                log_dict[f"E={k}/Train L0 Loss"]  = m.l0_loss().item()
-            wandb.log(log_dict, step=global_step)
-            global_step += 1
+                log_dict[f"E={k} Train MSE Loss"]     = m._loss.item()
+                log_dict[f"E={k} Train {sparsity_loss_type}"] = m.sparsity_loss_val.item()
+                log_dict[f"E={k} Train L0 Loss"]  = m.l0_loss().item()
+            wandb.log(log_dict)
 
             line = f"Train Epoch: {epoch} [batch {batch_idx}] Time {time.time()-orig_start_time}\t"
-            for k, m in models.items():
-                if type(m) == SAE:
-                    slt = "KL Divergence Loss"
-                elif type(m) == RELU_SAE:
-                    slt = "L1 Loss"
-                else:
-                    slt = "Sparsity Loss"
-                line += f"{k} MSE Loss: {m._loss.item():.6f} {slt}: {m.sparsity_loss_val.item()}  "
+            line += "  ".join([f"{k} MSE Loss: {m._loss.item():.6f} {sparsity_loss_type}: {m.sparsity_loss_val.item()}" for k, m in models.items()])
             print(line)
             orig_start_time = time.time()
-
-        # ── mid-epoch validation every val_every batches ──────────────────
-        if val_loader is not None and batch_idx > 0 and batch_idx % val_every == 0:
-            print(f"\n── Mid-epoch validation at batch {batch_idx} ──")
-            for m_val in models.values():
-                m_val.eval()
-            global_step = test(models, val_loader, model_folder_path,
-                               best_losses, mert, log=val_log, global_step=global_step)
-            for m_val in models.values():
-                m_val.train()
         #abt 30 mins of work
         # if batch_idx % 35 == 0 and batch_idx > 0:
-        # if False:
-        #     # ── checkpoint ───────────────────────────────────────────────────
-        #     ckpt_path =  checkpoints_path + f"/epoch{epoch}_batch{batch_idx}.pt"
-        #     ckpt_data = {
-        #         "epoch":     epoch,
-        #         "batch_idx": batch_idx,
-        #         "models": {
-        #             k: {
-        #                 "model_state": m.state_dict(),
-        #                 "optim_state": m.optim.state_dict(),
-        #                 "scheduler_state": m.scheduler.state_dict() if hasattr(m, "scheduler") and wandb.config.cascading_lr == True else None,
-        #             }
-        #             for k, m in models.items()
-        #         },
-        #     }
-        #     torch.save(ckpt_data, ckpt_path)
-        #     wandb.save(ckpt_path)  # syncs the file to the wandb run
+        if False:
+            # ── checkpoint ───────────────────────────────────────────────────
+            ckpt_path =  checkpoints_path + f"/epoch{epoch}_batch{batch_idx}.pt"
+            ckpt_data = {
+                "epoch":     epoch,
+                "batch_idx": batch_idx,
+                "models": {
+                    k: {
+                        "model_state": m.state_dict(),
+                        "optim_state": m.optim.state_dict(),
+                        "scheduler_state": m.scheduler.state_dict() if hasattr(m, "scheduler") and wandb.config.cascading_lr == True else None,
+                    }
+                    for k, m in models.items()
+                },
+            }
+            torch.save(ckpt_data, ckpt_path)
+            wandb.save(ckpt_path)  # syncs the file to the wandb run
         total_batches += 1
     # ── end-of-epoch summary ──────────────────────────────────────────────────
     if log is not None:
         for k, m in models.items():
             log[k].append((m._loss.item(), m.sparsity_loss_val.item()))
 
-    return global_step
 
-
-def test(models, loader, model_folder_path, best_losses, mert, log=None, global_step=0):
+def test(models, loader, model_folder_path, best_losses, mert, log=None):
     total_loss = {k: 0. for k in models}
     total_sparsity  = {k: 0. for k in models}
     total_l0 = {k: 0. for k in models}
@@ -458,9 +425,9 @@ def test(models, loader, model_folder_path, best_losses, mert, log=None, global_
         avg_sparsity  = total_sparsity[k] / n_batches
         avg_l0 = total_l0[k] / n_batches
         print(f"{k}:  loss: {avg_loss:.6f}    {sparsity_loss_type}: {avg_sparsity:.6f}    l0_loss: {avg_l0:.4f}")
-        log_dict[f"E={k}/Validation MSE Loss"]     = avg_loss
-        # log_dict[f"E={k}/Validation {sparsity_loss_type}"] = avg_sparsity
-        # log_dict[f"E={k}/Validation L0 Loss"]  = avg_l0
+        log_dict[f"E={k} Validation MSE Loss"]     = avg_loss
+        log_dict[f"E={k} Validation {sparsity_loss_type}"] = avg_sparsity
+        log_dict[f"E={k} Validation L0 Loss"]  = avg_l0
         if log is not None:
             log[k].append((avg_loss, avg_sparsity))
 
@@ -475,28 +442,9 @@ def test(models, loader, model_folder_path, best_losses, mert, log=None, global_
             }, best_path)
             print(f"  New best for {k}: {avg_loss:.6f} -> {best_path}")
 
-    wandb.log(log_dict, step=global_step)
-    global_step += 1
-    return global_step
+    wandb.log(log_dict)
 
-def checkpoint(epoch, model_folder_path, checkpoint_dir, batch_idx, models):
-    checkpoints_path = model_folder_path + "/" + checkpoint_dir
-    os.makedirs(checkpoints_path, exist_ok=True)
-    ckpt_file_path =  checkpoints_path + f"/epoch{epoch}_batch{batch_idx}.pt"
-    ckpt_data = {
-        "epoch":     epoch,
-        "batch_idx": batch_idx,
-        "models": {
-            k: {
-                "model_state": m.state_dict(),
-                "optim_state": m.optim.state_dict(),
-                "scheduler_state": m.scheduler.state_dict() if hasattr(m, "scheduler") and wandb.config.cascading_lr == True else None,
-            }
-            for k, m in models.items()
-        },
-    }
-    torch.save(ckpt_data, ckpt_file_path)
-    wandb.save(ckpt_file_path)  # syncs the file to the wandb run
+
 # ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
@@ -562,11 +510,11 @@ def main():
     test_ds  = FMALiveDataset(test_val["test"], processor)
 
     train_loader = DataLoader(train_ds, batch_size=wandb.config.batch_size,
-                              shuffle=True, collate_fn=audio_collate_fn,num_workers=4, pin_memory=True)
+                              shuffle=True, collate_fn=audio_collate_fn)
     val_loader   = DataLoader(val_ds,   batch_size=wandb.config.batch_size,
-                              collate_fn=audio_collate_fn,num_workers=4, pin_memory=True)
+                              collate_fn=audio_collate_fn)
     test_loader  = DataLoader(test_ds,  batch_size=wandb.config.batch_size,
-                              collate_fn=audio_collate_fn,num_workers=4, pin_memory=True)
+                              collate_fn=audio_collate_fn)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
 
     # ── 4. Determine SAE input shape via a sample MERT forward pass ───────
@@ -598,25 +546,26 @@ def main():
             )
 
     output_dir = cfg["output_dir"]
+    runs_dir = os.path.join(output_dir, "runs")
+    os.makedirs(runs_dir, exist_ok=True)
 
     RESUME_FROM = cfg["resume_from"]
 
-    # ── 6. Train ──────────────────────────────────────────────────────────
-    global_step = 0
-    for epoch in range(1, wandb.config.epochs+1):
-        for k, m in models.items():
-            m.train()
-        if bool(cfg["use_checkpoints"]) and epoch > 1:
-            model_folder_path = output_dir
-            checkpoint(epoch,model_folder_path, cfg["checkpoint_dir"],0,models)
+    model_folder_path = os.path.join(runs_dir, run_name)
+    os.makedirs(model_folder_path, exist_ok=True)
 
-        global_step = train(epoch, models, train_loader, wandb.config.sparsity_loss_weight,
-              output_dir, mert, log=train_log, resume_from=RESUME_FROM,
-              global_step=global_step,
-              val_loader=val_loader, best_losses=best_losses,
-              val_log=test_log, val_every=700)
+    # ── 6. Train ──────────────────────────────────────────────────────────
+    for epoch in range(1, wandb.config.epochs+1):
+        for m in models.values():
+            m.train()
+        train(epoch, models, train_loader, wandb.config.sparsity_loss_weight,
+              model_folder_path, mert, log=train_log, resume_from=RESUME_FROM,
+              checkpoint_dir="model_checkpoints")
         RESUME_FROM = None  # only resume first epoch
-        
+
+        for m in models.values():
+            m.eval()
+        test(models, val_loader, model_folder_path, best_losses, mert, log=test_log)
 
 
 if __name__ == "__main__":
