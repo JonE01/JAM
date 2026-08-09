@@ -598,6 +598,7 @@ def main():
             )
 
     output_dir = cfg["output_dir"]
+    os.makedirs(output_dir, exist_ok=True)
 
     RESUME_FROM = cfg["resume_from"]
 
