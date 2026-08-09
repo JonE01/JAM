@@ -27,7 +27,7 @@ cascading_lr: false
 "checkpoint_dir": "checkpoints"  # where to save checkpoints
 
 # Output
-output_dir: "/orcd/scratch/sae_train_large"            # where to save model outputs
+output_dir: "/home/joneba/orcd/scratch/sae_train_large"            # where to save model outputs
 
 # Resume
 resume_from: False             # e.g. "checkpoints/epoch3_batch200.pt"
