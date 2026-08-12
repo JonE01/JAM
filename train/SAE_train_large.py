@@ -657,8 +657,12 @@ def main():
                 m.optim, T_max=wandb.config.epochs * len(train_loader)
             )
 
+    # Per-run subfolder: checkpoints/best models for this run live under
+    # output_dir/run_name (e.g. sae_train_large/RELU_test_1e-2_5/checkpoints),
+    # so different runs never collide or overwrite each other's saves.
     output_dir = cfg["output_dir"]
-    os.makedirs(output_dir, exist_ok=True)
+    model_folder_path = os.path.join(output_dir, run_name)
+    os.makedirs(model_folder_path, exist_ok=True)
 
     # ── 6. Train ──────────────────────────────────────────────────────────
     global_step = resume_global_step if RESUME_FROM else 0
@@ -667,11 +671,10 @@ def main():
         for k, m in models.items():
             m.train()
         if bool(cfg["use_checkpoints"]) and epoch > start_epoch:
-            model_folder_path = output_dir
             checkpoint(epoch, model_folder_path, cfg["checkpoint_dir"], 0, models, global_step)
 
         global_step = train(epoch, models, train_loader, wandb.config.sparsity_loss_weight,
-              output_dir, mert, log=train_log, resume_from=RESUME_FROM,
+              model_folder_path, mert, log=train_log, resume_from=RESUME_FROM,
               global_step=global_step,
               val_loader=val_loader, best_losses=best_losses,
               val_log=test_log, val_every=700)
