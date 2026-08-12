@@ -472,6 +472,8 @@ def test(models, loader, model_folder_path, best_losses, mert, log=None, global_
                 "optim_state": m.optim.state_dict(),
                 "scheduler_state": m.scheduler.state_dict() if hasattr(m, "scheduler") and wandb.config.cascading_lr == True else None,
                 "val_loss": avg_loss,
+                "global_step": global_step,
+                "wandb_run_id": wandb.run.id if wandb.run is not None else None,
             }, best_path)
             print(f"  New best for {k}: {avg_loss:.6f} -> {best_path}")
 
@@ -479,13 +481,17 @@ def test(models, loader, model_folder_path, best_losses, mert, log=None, global_
     global_step += 1
     return global_step
 
-def checkpoint(epoch, model_folder_path, checkpoint_dir, batch_idx, models):
+def checkpoint(epoch, model_folder_path, checkpoint_dir, batch_idx, models, global_step=0):
     checkpoints_path = model_folder_path + "/" + checkpoint_dir
     os.makedirs(checkpoints_path, exist_ok=True)
     ckpt_file_path =  checkpoints_path + f"/epoch{epoch}_batch{batch_idx}.pt"
     ckpt_data = {
-        "epoch":     epoch,
-        "batch_idx": batch_idx,
+        "epoch":         epoch,
+        "batch_idx":     batch_idx,
+        "global_step":   global_step,
+        # Saved so a later `resume_from` can reattach to this exact wandb run
+        # instead of starting a new one (see main()'s resume-resolution logic).
+        "wandb_run_id":  wandb.run.id if wandb.run is not None else None,
         "models": {
             k: {
                 "model_state": m.state_dict(),
@@ -519,10 +525,64 @@ def main():
     }
 
     wandb.login(key=WANDB_API_KEY)
+
+    RESUME_FROM = cfg["resume_from"]
+
+    # ── Resolve which wandb run (if any) to reattach to, and where in
+    #    training the checkpoint left off ────────────────────────────────
+    resume_run_id = None
+    resume_epoch = 1
+    resume_global_step = 0
+
+    if RESUME_FROM:
+        try:
+            peeked_ckpt = torch.load(RESUME_FROM, map_location="cpu")
+        except FileNotFoundError:
+            print(f"WARNING: resume_from checkpoint not found at '{RESUME_FROM}'; "
+                  f"starting a fresh run instead.")
+            peeked_ckpt = None
+            RESUME_FROM = None
+
+        if peeked_ckpt is not None:
+            resume_epoch = peeked_ckpt.get("epoch", 1)
+            resume_global_step = peeked_ckpt.get("global_step", 0)
+            resume_run_id = peeked_ckpt.get("wandb_run_id")
+
+            if resume_run_id is not None:
+                print(f"Checkpoint records wandb run id '{resume_run_id}'; will resume that run.")
+            else:
+                # Older checkpoints (saved before wandb_run_id was tracked)
+                # don't have this — fall back to looking up the most recent
+                # run with a matching display name.
+                print(f"Checkpoint has no saved wandb_run_id; looking up the most "
+                      f"recent run named '{run_name}' in project '{cfg['wandb_project']}'...")
+                try:
+                    api = wandb.Api()
+                    entity = api.default_entity
+                    matches = api.runs(
+                        path=f"{entity}/{cfg['wandb_project']}",
+                        filters={"display_name": run_name},
+                        order="-created_at",
+                    )
+                    matches = list(matches)
+                    if len(matches) > 0:
+                        resume_run_id = matches[0].id
+                        print(f"  Found run '{resume_run_id}' (created {matches[0].created_at}).")
+                        if len(matches) > 1:
+                            print(f"  WARNING: {len(matches)} runs are named '{run_name}'; "
+                                  f"resuming the most recently created one — verify this "
+                                  f"is actually the run this checkpoint came from.")
+                    else:
+                        print(f"  No existing run named '{run_name}' found; starting a new wandb run.")
+                except Exception as e:
+                    print(f"  WARNING: run-name lookup failed ({e}); starting a new wandb run.")
+
     wandb.init(
         project=cfg["wandb_project"],
         name=run_name,
         config=wandb_config,
+        id=resume_run_id,
+        resume="must" if resume_run_id else None,
     )
 
     # ── 1. Load MERT model (frozen) ───────────────────────────────────────
@@ -600,23 +660,22 @@ def main():
     output_dir = cfg["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
 
-    RESUME_FROM = cfg["resume_from"]
-
     # ── 6. Train ──────────────────────────────────────────────────────────
-    global_step = 0
-    for epoch in range(1, wandb.config.epochs+1):
+    global_step = resume_global_step if RESUME_FROM else 0
+    start_epoch = resume_epoch if RESUME_FROM else 1
+    for epoch in range(start_epoch, wandb.config.epochs+1):
         for k, m in models.items():
             m.train()
-        if bool(cfg["use_checkpoints"]) and epoch > 1:
+        if bool(cfg["use_checkpoints"]) and epoch > start_epoch:
             model_folder_path = output_dir
-            checkpoint(epoch,model_folder_path, cfg["checkpoint_dir"],0,models)
+            checkpoint(epoch, model_folder_path, cfg["checkpoint_dir"], 0, models, global_step)
 
         global_step = train(epoch, models, train_loader, wandb.config.sparsity_loss_weight,
               output_dir, mert, log=train_log, resume_from=RESUME_FROM,
               global_step=global_step,
               val_loader=val_loader, best_losses=best_losses,
               val_log=test_log, val_every=700)
-        RESUME_FROM = None  # only resume first epoch
+        RESUME_FROM = None  # only resume the first (resumed) epoch's mid-epoch state
         
 
 
