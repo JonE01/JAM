@@ -1,7 +1,7 @@
 # SAE Training Config
 # Pass to SAE_train.py with: python SAE_train.py --config config.yaml
 
-run_name: "RELU_test_1e-2_5"
+run_name: "RELU_1e-2_5_layer-2"
 wandb_project: "mert-sae-large"
 
 # Model
@@ -11,7 +11,7 @@ mert_model_name: "m-a-p/MERT-v1-95M"
 
 # Data
 fma_dataset: "benjamin-paine/free-music-archive-large"
-layer_idx: -1
+layer_idx: -2
 window_size: 1125              # ~30 seconds at MERT frame rate
 
 # Training
@@ -30,4 +30,4 @@ cascading_lr: false
 output_dir: "/home/joneba/orcd/scratch/sae_train_large"            # where to save model outputs
 
 # Resume
-resume_from: checkpoints/epoch3_batch0.pt             # e.g. "checkpoints/epoch3_batch200.pt"
+resume_from: /home/joneba/orcd/scratch/sae_train_large/checkpoints/epoch3_batch0.pt             # e.g. "checkpoints/epoch3_batch200.pt"
